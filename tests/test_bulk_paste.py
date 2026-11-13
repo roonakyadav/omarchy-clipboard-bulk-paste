@@ -213,12 +213,37 @@ class TestBulkPastePythonLogic(unittest.TestCase):
 
     def test_unavailable_window_aborts_safely(self):
         """Calling bulk_paste with nonexistent window must abort without throwing unhandled exceptions."""
-        res = subprocess.run([
-            sys.executable, BULK_SCRIPT,
-            "--count", "3",
-            "--target-window", "0xdeadbeef"
-        ], capture_output=True, text=True)
-        self.assertIn("Target window 0xdeadbeef not found", res.stderr)
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump([{"type": "text", "text": "sample text"}], f)
+            temp_history = f.name
+        try:
+            res = subprocess.run([
+                sys.executable, BULK_SCRIPT,
+                "--count", "1",
+                "--history", temp_history,
+                "--target-window", "0xdeadbeef"
+            ], capture_output=True, text=True)
+            self.assertIn("Target window 0xdeadbeef not found", res.stderr)
+        finally:
+            if os.path.exists(temp_history):
+                os.remove(temp_history)
+
+    def test_empty_history_aborts_safely(self):
+        """Calling bulk_paste when history is empty must abort gracefully."""
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump([], f)
+            temp_history = f.name
+        try:
+            res = subprocess.run([
+                sys.executable, BULK_SCRIPT,
+                "--count", "1",
+                "--history", temp_history,
+                "--target-window", "0xdeadbeef"
+            ], capture_output=True, text=True)
+            self.assertIn("No valid clipboard items to paste", res.stderr)
+        finally:
+            if os.path.exists(temp_history):
+                os.remove(temp_history)
 
     def test_invalid_arguments_exit_code(self):
         # Missing target window
@@ -240,13 +265,21 @@ class TestBulkPastePythonLogic(unittest.TestCase):
 
     def test_repeated_execution_state_isolation(self):
         """Running multiple calls successively must not leave contaminated state."""
-        for _ in range(5):
-            res = subprocess.run([
-                sys.executable, BULK_SCRIPT,
-                "--count", "1",
-                "--target-window", "0xdeadbeef"
-            ], capture_output=True, text=True)
-            self.assertIn("Target window 0xdeadbeef not found", res.stderr)
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump([{"type": "text", "text": "item"}], f)
+            temp_history = f.name
+        try:
+            for _ in range(5):
+                res = subprocess.run([
+                    sys.executable, BULK_SCRIPT,
+                    "--count", "1",
+                    "--history", temp_history,
+                    "--target-window", "0xdeadbeef"
+                ], capture_output=True, text=True)
+                self.assertIn("Target window 0xdeadbeef not found", res.stderr)
+        finally:
+            if os.path.exists(temp_history):
+                os.remove(temp_history)
 
 
 class TestLivePasteIntegration(unittest.TestCase):

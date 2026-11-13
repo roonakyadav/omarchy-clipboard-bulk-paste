@@ -203,6 +203,7 @@ def normalize_history_items(raw_items):
 
 def execute_bulk_paste(entries, target_address, delay_text=0.15, delay_image=0.35, requested_count=None):
     if not entries:
+        log("No valid clipboard items to paste.")
         notify("Bulk Paste", "No valid clipboard items to paste.", urgency="normal")
         return
 
