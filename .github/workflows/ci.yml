@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Unit Tests and Linting
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq perl
+
+      - name: Validate manifest syntax and schema
+        run: |
+          jq -e . manifest.json >/dev/null
+          jq -e '.schemaVersion == 1' manifest.json
+          jq -e 'has("id") and has("name") and has("version") and has("kinds") and has("entryPoints")' manifest.json
+          jq -e '(.kinds | type) == "array" and (.kinds | length) > 0' manifest.json
+          jq -e '(.entryPoints | type) == "object"' manifest.json
+          jq -e '.entryPoints.overlay == "Clipboard.qml"' manifest.json
+          test -f Clipboard.qml
+
+      - name: Validate shell script syntax
+        run: |
+          bash -n capture.sh
+
+      - name: Validate Python script syntax
+        run: |
+          python3 -m py_compile bulk_paste.py tests/test_bulk_paste.py tests/test_multi_image_paste.py
+
+      - name: Run unit test suite
+        run: |
+          python3 -m unittest discover -s tests -v

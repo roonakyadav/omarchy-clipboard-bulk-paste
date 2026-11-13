@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "roonakyadav.clipboard-bulk-paste",
+  "name": "Clipboard Bulk Paste",
+  "version": "1.0.0",
+  "author": "Ronak Yadav",
+  "description": "Smart clipboard manager for Omarchy with chronological bulk history pasting, multi-image pipelines, and Wayland desktop integration",
+  "license": "MIT",
+  "kinds": [
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Clipboard.qml"
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.clipboard"
+  }
+}
