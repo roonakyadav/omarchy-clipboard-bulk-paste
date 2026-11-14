@@ -112,28 +112,46 @@ def focus_window(address):
     return res2.returncode == 0
 
 
+def is_window_active(target_address):
+    """Verifies that the target window is currently confirmed as the active window in Hyprland.
+    Never relies on exit codes or client existence; strictly verifies activewindow address.
+    """
+    if not target_address:
+        return False
+    active = get_hyprland_active_window()
+    active_addr = str(active.get("address", "")).strip().lower()
+    target_clean = str(target_address).strip().lower()
+    return bool(active_addr and active_addr == target_clean)
+
+
 def ensure_window_focused(target_address, client_title="", max_wait=0.25):
-    """Verifies target window exists and is focused. Refocuses if needed."""
+    """Verifies target window exists and is confirmed as the active window. Refocuses if needed.
+    Fails closed: if the target is not confirmed as the active window after the focus attempt
+    and timeout, returns (False, None). Never treats a successful command exit code or client
+    existence as proof of focus.
+    """
+    if not target_address:
+        return False, None
+
     clients = get_hyprland_clients()
     client = find_client_by_address(clients, target_address)
     if not client:
+        log(f"Target window {target_address} not found in client list.")
         return False, None
 
-    active = get_hyprland_active_window()
-    if str(active.get("address", "")).lower() == str(target_address).lower():
+    if is_window_active(target_address):
         return True, client
 
-    # Refocus
+    # Refocus if not currently active
     focus_window(target_address)
     start = time.time()
     while time.time() - start < max_wait:
         time.sleep(0.02)
-        active = get_hyprland_active_window()
-        if str(active.get("address", "")).lower() == str(target_address).lower():
+        if is_window_active(target_address):
             return True, client
 
-    # Even if activewindow report lagged, client still exists
-    return True, client
+    log(f"Target window {target_address} failed to acquire active focus within {max_wait}s; failing closed.")
+    return False, None
 
 
 def wait_for_clipboard_ready(expected_mime=None, timeout=0.5):
@@ -152,7 +170,25 @@ def wait_for_clipboard_ready(expected_mime=None, timeout=0.5):
     return False
 
 
-def send_paste_keys(is_terminal):
+# NOTE ON WAYLAND RACE CONDITION BOUNDARY:
+# Under the Wayland virtual-keyboard-v1 protocol used by `wtype`, synthetic keystrokes are
+# injected into the compositor's seat and dispatched to whatever surface holds keyboard focus.
+# Wayland protocol does not allow client-directed keystroke delivery to arbitrary surface IDs.
+# By checking `is_window_active(target_address)` immediately prior to wtype injection (after
+# clipboard preparation), we eliminate the previous ~300ms window where focus could drift,
+# narrowing the remaining window to the minimal IPC roundtrip time (~1ms).
+# If focus switches during that sub-millisecond gap, keystrokes could still land in the
+# newly focused window. This cannot be eliminated without compositor-native targeted input injection.
+def send_paste_keys(is_terminal, target_address=None):
+    """Dispatches paste keystrokes to the active window via wtype.
+    If target_address is provided, strictly revalidates that target_address is the active
+    window immediately before executing wtype. Aborts and returns False if verification fails.
+    """
+    if target_address is not None:
+        if not is_window_active(target_address):
+            log(f"Refusing to send paste keys: target {target_address} is not the active window.")
+            return False
+
     if is_terminal:
         # Terminal standard paste: Shift + Insert
         subprocess.run(["wtype", "-M", "shift", "-k", "Insert", "-m", "shift"],
@@ -161,6 +197,7 @@ def send_paste_keys(is_terminal):
         # GUI standard paste: Ctrl + V
         subprocess.run(["wtype", "-M", "ctrl", "-k", "v", "-m", "ctrl"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    return True
 
 
 def load_history(history_path=None):
@@ -230,6 +267,7 @@ def execute_bulk_paste(entries, target_address, delay_text=0.15, delay_image=0.3
     # Initial focus settlement
     focus_ok, client = ensure_window_focused(target_address, app_name, max_wait=0.3)
     if not focus_ok:
+        log(f"Initial focus on target window {target_address} failed.")
         notify("Bulk Paste Aborted", "Failed to focus target window.", urgency="normal")
         return
     time.sleep(0.06)
@@ -242,9 +280,9 @@ def execute_bulk_paste(entries, target_address, delay_text=0.15, delay_image=0.3
         # 1. Safety focus check before each paste
         focus_ok, client = ensure_window_focused(target_address, app_name, max_wait=0.2)
         if not focus_ok:
-            log(f"Target window disappeared mid-paste at item {idx + 1}")
+            log(f"Target window {target_address} lost focus or closed before item {idx + 1}; aborting")
             notify("Bulk Paste Stopped",
-                   f"Target window closed after pasting {succeeded} of {total} items.",
+                   f"Target window closed or lost focus after pasting {succeeded} of {total} items.",
                    urgency="normal")
             return
 
@@ -264,7 +302,17 @@ def execute_bulk_paste(entries, target_address, delay_text=0.15, delay_image=0.3
                 wait_for_clipboard_ready("text/plain", timeout=0.3)
                 time.sleep(0.03)
 
-                send_paste_keys(is_terminal)
+                # Revalidate target window immediately prior to keystroke injection
+                if not is_window_active(target_address):
+                    log(f"Focus changed before text paste at item {idx + 1}; aborting immediately")
+                    notify("Bulk Paste Aborted", "Target window lost focus; paste aborted for safety.", urgency="normal")
+                    return
+
+                if not send_paste_keys(is_terminal, target_address=target_address):
+                    log(f"Keystroke injection blocked: target window {target_address} verification failed at item {idx + 1}")
+                    notify("Bulk Paste Aborted", "Target window verification failed; paste aborted for safety.", urgency="normal")
+                    return
+
                 time.sleep(delay_text)
                 succeeded += 1
             except Exception as e:
@@ -294,7 +342,17 @@ def execute_bulk_paste(entries, target_address, delay_text=0.15, delay_image=0.3
                 wait_for_clipboard_ready(mime, timeout=0.4)
                 time.sleep(0.04)
 
-                send_paste_keys(is_terminal)
+                # Revalidate target window immediately prior to keystroke injection
+                if not is_window_active(target_address):
+                    log(f"Focus changed before image paste at item {idx + 1}; aborting immediately")
+                    notify("Bulk Paste Aborted", "Target window lost focus; paste aborted for safety.", urgency="normal")
+                    return
+
+                if not send_paste_keys(is_terminal, target_address=target_address):
+                    log(f"Keystroke injection blocked: target window {target_address} verification failed at item {idx + 1}")
+                    notify("Bulk Paste Aborted", "Target window verification failed; paste aborted for safety.", urgency="normal")
+                    return
+
                 time.sleep(delay_image)
                 succeeded += 1
             except Exception as e:

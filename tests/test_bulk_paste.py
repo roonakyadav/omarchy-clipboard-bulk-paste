@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import MagicMock, call, patch
 
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BULK_SCRIPT = os.path.join(REPO_DIR, "bulk_paste.py")
@@ -280,6 +281,234 @@ class TestBulkPastePythonLogic(unittest.TestCase):
         finally:
             if os.path.exists(temp_history):
                 os.remove(temp_history)
+
+
+class TestFocusVerificationSecurityRegression(unittest.TestCase):
+    """Regression test suite for target window focus verification and fail-closed security guarantees.
+    Verifies that no clipboard history or keystrokes are ever sent to an unverified or unintended window.
+    All Hyprland and clipboard subprocess interactions are strictly mocked.
+    """
+
+    def setUp(self):
+        if REPO_DIR not in sys.path:
+            sys.path.insert(0, REPO_DIR)
+        import bulk_paste
+        self.bp = bulk_paste
+        self.notify_patcher = patch.object(self.bp, "notify")
+        self.mock_notify = self.notify_patcher.start()
+
+    def tearDown(self):
+        self.notify_patcher.stop()
+
+    def test_is_window_active(self):
+        """is_window_active must strictly verify that the active window address matches."""
+        with patch.object(self.bp, "get_hyprland_active_window", return_value={"address": "0x5571f7a63ec0"}):
+            self.assertTrue(self.bp.is_window_active("0x5571f7a63ec0"))
+            self.assertTrue(self.bp.is_window_active("0x5571F7A63EC0"))
+            self.assertFalse(self.bp.is_window_active("0x999999999999"))
+            self.assertFalse(self.bp.is_window_active(""))
+            self.assertFalse(self.bp.is_window_active(None))
+
+        with patch.object(self.bp, "get_hyprland_active_window", return_value={}):
+            self.assertFalse(self.bp.is_window_active("0x5571f7a63ec0"))
+
+    def test_target_already_focused(self):
+        """When target is already active, ensure_window_focused returns (True, client) without dispatching focus command."""
+        target = "0xTARGET"
+        mock_client = {"address": "0xtarget", "title": "Editor", "class": "gedit"}
+        with patch.object(self.bp, "get_hyprland_clients", return_value=[mock_client]), \
+             patch.object(self.bp, "get_hyprland_active_window", return_value={"address": "0xtarget"}), \
+             patch.object(self.bp, "focus_window") as mock_focus:
+            ok, client = self.bp.ensure_window_focused(target)
+            self.assertTrue(ok)
+            self.assertEqual(client, mock_client)
+            mock_focus.assert_not_called()
+
+    def test_focus_successfully_changes_to_target(self):
+        """When target is not active initially, focus is requested and succeeds upon verification."""
+        target = "0xTARGET"
+        mock_client = {"address": "0xtarget", "title": "Editor", "class": "gedit"}
+        active_sequence = [{"address": "0xOTHER"}, {"address": "0xtarget"}]
+        with patch.object(self.bp, "get_hyprland_clients", return_value=[mock_client]), \
+             patch.object(self.bp, "get_hyprland_active_window", side_effect=active_sequence), \
+             patch.object(self.bp, "focus_window", return_value=True) as mock_focus:
+            ok, client = self.bp.ensure_window_focused(target, max_wait=0.2)
+            self.assertTrue(ok)
+            self.assertEqual(client, mock_client)
+            mock_focus.assert_called_once_with(target)
+
+    def test_focus_command_succeeds_but_actual_focus_does_not_change(self):
+        """A successful hyprctl command returncode MUST NOT be treated as proof of focus.
+        Must fail closed and return (False, None) when active window does not match.
+        """
+        target = "0xTARGET"
+        mock_client = {"address": "0xtarget", "title": "Editor", "class": "gedit"}
+        with patch.object(self.bp, "get_hyprland_clients", return_value=[mock_client]), \
+             patch.object(self.bp, "get_hyprland_active_window", return_value={"address": "0xOTHER"}), \
+             patch.object(self.bp, "focus_window", return_value=True) as mock_focus:
+            ok, client = self.bp.ensure_window_focused(target, max_wait=0.05)
+            self.assertFalse(ok)
+            self.assertIsNone(client)
+            mock_focus.assert_called_once_with(target)
+
+    def test_another_window_remains_active_after_all_retries(self):
+        """When polling retries expire without active window matching target, return (False, None)."""
+        target = "0xTARGET"
+        mock_client = {"address": "0xtarget", "title": "Editor", "class": "gedit"}
+        with patch.object(self.bp, "get_hyprland_clients", return_value=[mock_client]), \
+             patch.object(self.bp, "get_hyprland_active_window", return_value={"address": "0xUNINTENDED"}), \
+             patch.object(self.bp, "focus_window", return_value=False):
+            ok, client = self.bp.ensure_window_focused(target, max_wait=0.05)
+            self.assertFalse(ok)
+            self.assertIsNone(client)
+
+    def test_target_missing_from_clients(self):
+        """If target window address is not among Hyprland clients, fail closed immediately."""
+        with patch.object(self.bp, "get_hyprland_clients", return_value=[]):
+            ok, client = self.bp.ensure_window_focused("0xNONEXISTENT")
+            self.assertFalse(ok)
+            self.assertIsNone(client)
+
+    def test_target_disappears_during_replay(self):
+        """If target window disappears mid-paste, execution must abort immediately and no further keys sent."""
+        target = "0xTARGET"
+        mock_client = {"address": "0xtarget", "title": "Terminal", "class": "foot"}
+        entries = [
+            {"type": "text", "text": "item 1"},
+            {"type": "text", "text": "item 2"}
+        ]
+        # Sequence of clients queries:
+        # 1. execute_bulk_paste initial find_client_by_address
+        # 2. execute_bulk_paste initial ensure_window_focused
+        # 3. item 1 ensure_window_focused
+        # 4. item 2 ensure_window_focused -> window closed!
+        clients_seq = [
+            [mock_client],
+            [mock_client],
+            [mock_client],
+            []
+        ]
+
+        with patch.object(self.bp, "get_hyprland_clients", side_effect=clients_seq), \
+             patch.object(self.bp, "get_hyprland_active_window", return_value={"address": "0xtarget"}), \
+             patch.object(self.bp, "send_paste_keys") as mock_paste, \
+             patch.object(self.bp, "wait_for_clipboard_ready", return_value=True), \
+             patch.object(self.bp, "notify") as mock_notify, \
+             patch("subprocess.Popen") as mock_popen:
+            proc_inst = MagicMock()
+            proc_inst.communicate.return_value = (b"", b"")
+            mock_popen.return_value = proc_inst
+
+            self.bp.execute_bulk_paste(entries, target, delay_text=0.001)
+
+            # Only item 1 was pasted; item 2 was aborted before paste keys
+            self.assertEqual(mock_paste.call_count, 1)
+            mock_notify.assert_any_call("Bulk Paste Stopped",
+                                        "Target window closed or lost focus after pasting 1 of 2 items.",
+                                        urgency="normal")
+
+    def test_focus_changes_between_clipboard_preparation_and_paste(self):
+        """If active window changes to another window during clipboard preparation,
+        paste keys MUST NOT be sent, and execution must abort immediately.
+        """
+        target = "0xTARGET"
+        mock_client = {"address": "0xtarget", "title": "Terminal", "class": "foot"}
+        entries = [{"type": "text", "text": "sensitive_token_here"}]
+
+        # Sequence for active window queries:
+        # 1. initial ensure_window_focused -> target
+        # 2. item 1 ensure_window_focused -> target
+        # 3. pre-paste check (after wl-copy) -> OTHER window is active! Focus lost!
+        active_seq = [
+            {"address": "0xtarget"},
+            {"address": "0xtarget"},
+            {"address": "0xUNINTENDED_BROWSER"}
+        ]
+
+        with patch.object(self.bp, "get_hyprland_clients", return_value=[mock_client]), \
+             patch.object(self.bp, "get_hyprland_active_window", side_effect=active_seq), \
+             patch.object(self.bp, "send_paste_keys") as mock_paste, \
+             patch.object(self.bp, "wait_for_clipboard_ready", return_value=True), \
+             patch.object(self.bp, "notify") as mock_notify, \
+             patch("subprocess.Popen") as mock_popen:
+            proc_inst = MagicMock()
+            proc_inst.communicate.return_value = (b"", b"")
+            mock_popen.return_value = proc_inst
+
+            self.bp.execute_bulk_paste(entries, target, delay_text=0.001)
+
+            # Paste keys must NEVER be sent!
+            mock_paste.assert_not_called()
+            mock_notify.assert_any_call("Bulk Paste Aborted",
+                                        "Target window lost focus; paste aborted for safety.",
+                                        urgency="normal")
+
+    def test_image_focus_changes_between_preparation_and_paste(self):
+        """If active window changes during image clipboard preparation,
+        paste keys MUST NOT be sent for image, and execution must abort.
+        """
+        target = "0xTARGET"
+        mock_client = {"address": "0xtarget", "title": "Editor", "class": "gedit"}
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            f.write(b"\x89PNG\r\n\x1a\nfakeimage")
+            img_path = f.name
+
+        try:
+            entries = [{"type": "image", "path": img_path, "mime": "image/png"}]
+            active_seq = [
+                {"address": "0xtarget"},
+                {"address": "0xtarget"},
+                {"address": "0xDIFFERENT_APP"}
+            ]
+
+            with patch.object(self.bp, "get_hyprland_clients", return_value=[mock_client]), \
+                 patch.object(self.bp, "get_hyprland_active_window", side_effect=active_seq), \
+                 patch.object(self.bp, "send_paste_keys") as mock_paste, \
+                 patch.object(self.bp, "wait_for_clipboard_ready", return_value=True), \
+                 patch.object(self.bp, "notify") as mock_notify, \
+                 patch("subprocess.Popen") as mock_popen:
+                proc_inst = MagicMock()
+                proc_inst.communicate.return_value = (b"", b"")
+                mock_popen.return_value = proc_inst
+
+                self.bp.execute_bulk_paste(entries, target, delay_image=0.001)
+
+                mock_paste.assert_not_called()
+                mock_notify.assert_any_call("Bulk Paste Aborted",
+                                            "Target window lost focus; paste aborted for safety.",
+                                            urgency="normal")
+        finally:
+            if os.path.exists(img_path):
+                os.remove(img_path)
+
+    def test_no_paste_keystrokes_sent_when_target_verification_fails(self):
+        """send_paste_keys with target_address must strictly block wtype when verification fails."""
+        with patch.object(self.bp, "is_window_active", return_value=False), \
+             patch("subprocess.run") as mock_subproc:
+            res = self.bp.send_paste_keys(is_terminal=False, target_address="0xTARGET")
+            self.assertFalse(res)
+            mock_subproc.assert_not_called()
+
+        with patch.object(self.bp, "is_window_active", return_value=True), \
+             patch("subprocess.run") as mock_subproc:
+            res = self.bp.send_paste_keys(is_terminal=False, target_address="0xTARGET")
+            self.assertTrue(res)
+            mock_subproc.assert_called_once()
+            call_args = mock_subproc.call_args[0][0]
+            self.assertIn("wtype", call_args)
+
+    def test_initial_focus_failure_aborts_without_keystrokes(self):
+        """If initial ensure_window_focused fails, abort immediately before loop starts."""
+        target = "0xTARGET"
+        mock_client = {"address": "0xtarget", "title": "Editor", "class": "gedit"}
+        entries = [{"type": "text", "text": "will_not_paste"}]
+
+        with patch.object(self.bp, "get_hyprland_clients", return_value=[mock_client]), \
+             patch.object(self.bp, "ensure_window_focused", return_value=(False, None)), \
+             patch.object(self.bp, "send_paste_keys") as mock_paste:
+            self.bp.execute_bulk_paste(entries, target)
+            mock_paste.assert_not_called()
 
 
 class TestLivePasteIntegration(unittest.TestCase):
